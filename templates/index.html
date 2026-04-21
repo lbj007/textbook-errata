@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>教材勘误助手</title>
+<style>
+  :root {
+    --primary: #2c3e50;
+    --accent: #3498db;
+    --red: #e74c3c;
+    --green: #27ae60;
+    --orange: #f39c12;
+    --gray: #95a5a6;
+    --light: #ecf0f1;
+    --bg: #f5f7fa;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--primary);
+    min-height: 100vh;
+  }
+  .container { max-width: 800px; margin: 0 auto; padding: 40px 20px; }
+
+  header { text-align: center; margin-bottom: 40px; }
+  header h1 { font-size: 28px; margin-bottom: 8px; }
+  header p { color: var(--gray); font-size: 14px; }
+
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    padding: 32px;
+    margin-bottom: 24px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  }
+  .card h2 { font-size: 16px; margin-bottom: 16px; color: var(--primary); }
+
+  /* Upload area */
+  .upload-zone {
+    border: 2px dashed #ccc;
+    border-radius: 12px;
+    padding: 48px 24px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: var(--bg);
+    margin-bottom: 20px;
+  }
+  .upload-zone:hover, .upload-zone.dragover {
+    border-color: var(--accent);
+    background: #eaf4fd;
+  }
+  .upload-zone .icon { font-size: 48px; margin-bottom: 12px; }
+  .upload-zone p { color: var(--gray); margin-bottom: 8px; }
+  .upload-zone .hint { font-size: 12px; color: #bbb; }
+  #file-input { display: none; }
+
+  /* File list */
+  .file-list { margin-bottom: 20px; }
+  .file-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; background: var(--light); border-radius: 8px;
+    margin-bottom: 8px; font-size: 14px;
+  }
+  .file-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-item .size { color: var(--gray); margin-left: 12px; font-size: 12px; }
+  .file-item .remove { color: var(--red); cursor: pointer; margin-left: 12px; font-size: 18px; }
+
+  /* API key */
+  .api-row {
+    display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap;
+  }
+  .api-row label { font-size: 13px; white-space: nowrap; font-weight: 600; }
+  .api-row input, .api-row select {
+    flex: 1; min-width: 200px; padding: 10px 14px; border: 1px solid #ddd;
+    border-radius: 8px; font-size: 14px; outline: none;
+  }
+  .api-row input:focus, .api-row select:focus { border-color: var(--accent); }
+  .api-row select { flex: 0; min-width: 180px; }
+
+  /* Button */
+  .btn {
+    display: inline-block; padding: 12px 32px;
+    background: var(--accent); color: #fff; border: none;
+    border-radius: 8px; font-size: 16px; cursor: pointer;
+    transition: background 0.2s; width: 100%;
+  }
+  .btn:hover { background: #2980b9; }
+  .btn:disabled { background: #bbb; cursor: not-allowed; }
+
+  /* Progress */
+  .progress-section { display: none; }
+  .progress-bar-wrap {
+    background: var(--light); border-radius: 8px; height: 8px;
+    overflow: hidden; margin-bottom: 16px;
+  }
+  .progress-bar {
+    height: 100%; background: var(--accent); border-radius: 8px;
+    transition: width 0.3s; width: 0%;
+  }
+  .progress-log {
+    background: #1e1e1e; color: #d4d4d4; border-radius: 8px;
+    padding: 16px; font-family: "SF Mono", Monaco, monospace;
+    font-size: 12px; max-height: 240px; overflow-y: auto;
+    line-height: 1.8;
+  }
+  .progress-log .error { color: var(--red); }
+  .progress-log .done { color: var(--green); }
+
+  /* Results */
+  .results-section { display: none; }
+  .result-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px; background: var(--light); border-radius: 10px;
+    margin-bottom: 12px;
+  }
+  .result-info { flex: 1; }
+  .result-info .title { font-weight: 600; margin-bottom: 4px; }
+  .result-info .meta { font-size: 12px; color: var(--gray); }
+  .result-info .meta .high { color: var(--red); font-weight: 600; }
+  .result-info .meta .mid { color: var(--orange); }
+  .result-info .meta .low { color: var(--accent); }
+  .dl-btn {
+    padding: 8px 20px; background: var(--green); color: #fff;
+    border: none; border-radius: 6px; cursor: pointer; font-size: 14px;
+    text-decoration: none;
+  }
+  .dl-btn:hover { background: #219a52; }
+  .result-error { color: var(--red); font-size: 13px; }
+
+  /* Dimensions info */
+  .dimensions {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 8px; margin-top: 12px;
+  }
+  .dim-tag {
+    font-size: 11px; padding: 6px 10px; background: var(--light);
+    border-radius: 6px; text-align: center; color: var(--primary);
+  }
+
+  @media (max-width: 600px) {
+    .container { padding: 20px 12px; }
+    .card { padding: 20px; }
+    .upload-zone { padding: 32px 16px; }
+    .api-row { flex-direction: column; }
+    .api-row input, .api-row select { min-width: unset; width: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>教材勘误助手</h1>
+    <p>上传教材/教辅 PDF，AI 自动进行出版级别全面审校并生成勘误表</p>
+  </header>
+
+  <!-- Upload Card -->
+  <div class="card" id="upload-card">
+    <h2>上传文件</h2>
+    <div class="upload-zone" id="upload-zone">
+      <div class="icon">📄</div>
+      <p>拖拽 PDF 文件到此处，或点击选择文件</p>
+      <div class="hint">支持同时上传多个 PDF，单文件最大 100MB，超过 10MB 自动压缩</div>
+    </div>
+    <input type="file" id="file-input" accept=".pdf" multiple>
+    <div class="file-list" id="file-list"></div>
+
+    <div class="api-row">
+      <label>API Key</label>
+      <input type="password" id="api-key" placeholder="sk-ant-... (Anthropic API Key)">
+    </div>
+    <div class="api-row">
+      <label>模型</label>
+      <select id="model-select">
+        <option value="claude-sonnet-4-5-20250514">Claude Sonnet 4.5 (推荐，性价比高)</option>
+        <option value="claude-opus-4-5-20250514">Claude Opus 4.5 (更精准，较慢)</option>
+      </select>
+    </div>
+
+    <button class="btn" id="start-btn" disabled>开始校对</button>
+
+    <div style="margin-top: 20px;">
+      <h2 style="font-size: 13px; color: var(--gray);">审查维度（12项全覆盖）</h2>
+      <div class="dimensions">
+        <div class="dim-tag">空格规范</div>
+        <div class="dim-tag">编号格式</div>
+        <div class="dim-tag">中英对称性</div>
+        <div class="dim-tag">标点符号</div>
+        <div class="dim-tag">数学内容</div>
+        <div class="dim-tag">翻译准确性</div>
+        <div class="dim-tag">图文一致性</div>
+        <div class="dim-tag">措辞一致性</div>
+        <div class="dim-tag">答案页格式</div>
+        <div class="dim-tag">量词用语</div>
+        <div class="dim-tag">品牌标识</div>
+        <div class="dim-tag">装饰性英文</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Progress Card -->
+  <div class="card progress-section" id="progress-card">
+    <h2>校对进度</h2>
+    <div class="progress-bar-wrap">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+    <div class="progress-log" id="progress-log"></div>
+  </div>
+
+  <!-- Results Card -->
+  <div class="card results-section" id="results-card">
+    <h2>勘误结果</h2>
+    <div id="results-list"></div>
+  </div>
+</div>
+
+<script>
+const uploadZone = document.getElementById('upload-zone');
+const fileInput = document.getElementById('file-input');
+const fileList = document.getElementById('file-list');
+const startBtn = document.getElementById('start-btn');
+const progressCard = document.getElementById('progress-card');
+const progressBar = document.getElementById('progress-bar');
+const progressLog = document.getElementById('progress-log');
+const resultsCard = document.getElementById('results-card');
+const resultsList = document.getElementById('results-list');
+
+let selectedFiles = [];
+
+// Drag & drop
+uploadZone.addEventListener('click', () => fileInput.click());
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('dragover'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadZone.classList.remove('dragover');
+  addFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', () => addFiles(fileInput.files));
+
+function addFiles(files) {
+  for (const f of files) {
+    if (f.name.toLowerCase().endsWith('.pdf') && !selectedFiles.find(s => s.name === f.name)) {
+      selectedFiles.push(f);
+    }
+  }
+  renderFileList();
+}
+
+function renderFileList() {
+  fileList.innerHTML = '';
+  selectedFiles.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'file-item';
+    const sizeMB = (f.size / 1024 / 1024).toFixed(1);
+    const sizeNote = f.size > 10 * 1024 * 1024 ? ' (将自动压缩)' : '';
+    div.innerHTML = `
+      <span class="name">${f.name}</span>
+      <span class="size">${sizeMB} MB${sizeNote}</span>
+      <span class="remove" onclick="removeFile(${i})">&times;</span>
+    `;
+    fileList.appendChild(div);
+  });
+  startBtn.disabled = selectedFiles.length === 0;
+}
+
+function removeFile(idx) {
+  selectedFiles.splice(idx, 1);
+  renderFileList();
+}
+
+// Start proofreading
+startBtn.addEventListener('click', async () => {
+  const apiKey = document.getElementById('api-key').value.trim();
+  const model = document.getElementById('model-select').value;
+
+  if (!apiKey) {
+    alert('请输入 Anthropic API Key');
+    return;
+  }
+  if (selectedFiles.length === 0) return;
+
+  startBtn.disabled = true;
+  progressCard.style.display = 'block';
+  resultsCard.style.display = 'none';
+  progressLog.innerHTML = '';
+  progressBar.style.width = '0%';
+  resultsList.innerHTML = '';
+
+  const formData = new FormData();
+  formData.append('api_key', apiKey);
+  formData.append('model', model);
+  selectedFiles.forEach(f => formData.append('files', f));
+
+  try {
+    const resp = await fetch('/upload', { method: 'POST', body: formData });
+    const data = await resp.json();
+    if (data.error) {
+      logMsg(data.error, 'error');
+      startBtn.disabled = false;
+      return;
+    }
+
+    logMsg(`已上传 ${data.file_count} 个文件，开始处理...`);
+    listenProgress(data.task_id);
+  } catch (e) {
+    logMsg('上传失败: ' + e.message, 'error');
+    startBtn.disabled = false;
+  }
+});
+
+function listenProgress(taskId) {
+  const es = new EventSource(`/status/${taskId}`);
+  es.onmessage = (event) => {
+    const d = JSON.parse(event.data);
+
+    if (d.stage === 'final') {
+      es.close();
+      progressBar.style.width = '100%';
+
+      if (d.status === 'done') {
+        logMsg('全部处理完成!', 'done');
+        showResults(d.results, taskId);
+      } else {
+        logMsg('处理出错: ' + (d.error || '未知错误'), 'error');
+      }
+      startBtn.disabled = false;
+      return;
+    }
+
+    if (d.pct !== undefined) progressBar.style.width = d.pct + '%';
+    const cls = d.stage === 'error' ? 'error' : (d.stage === 'done' ? 'done' : '');
+    logMsg(d.message, cls);
+  };
+  es.onerror = () => {
+    es.close();
+    logMsg('连接中断', 'error');
+    startBtn.disabled = false;
+  };
+}
+
+function logMsg(msg, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  const now = new Date().toLocaleTimeString('zh-CN');
+  line.textContent = `[${now}] ${msg}`;
+  progressLog.appendChild(line);
+  progressLog.scrollTop = progressLog.scrollHeight;
+}
+
+function showResults(results, taskId) {
+  resultsCard.style.display = 'block';
+  resultsList.innerHTML = '';
+
+  results.forEach(r => {
+    const div = document.createElement('div');
+    div.className = 'result-item';
+
+    if (r.errata_count >= 0) {
+      div.innerHTML = `
+        <div class="result-info">
+          <div class="title">${r.original_name}</div>
+          <div class="meta">
+            共 ${r.total_pages} 页，发现 <strong>${r.errata_count}</strong> 处问题
+            ${r.compressed ? ' | 已压缩处理' : ''}
+          </div>
+        </div>
+        <a class="dl-btn" href="${r.download_url}" download>下载勘误表</a>
+      `;
+    } else {
+      div.innerHTML = `
+        <div class="result-info">
+          <div class="title">${r.original_name}</div>
+          <div class="result-error">${r.error || '处理失败'}</div>
+        </div>
+      `;
+    }
+    resultsList.appendChild(div);
+  });
+
+  resultsCard.scrollIntoView({ behavior: 'smooth' });
+}
+</script>
+</body>
+</html>
