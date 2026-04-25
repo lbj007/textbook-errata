@@ -210,7 +210,10 @@ def _call_claude_vision(client, pages_batch, filename, model="claude-sonnet-4-5-
 def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
     """Generate annotated page screenshots with red boxes around error locations.
 
-    Uses PIL to draw red rectangles on rendered page images for reliability.
+    Strategy:
+    1. Try direct text search first (works if PDF has text layer).
+    2. If no text layer, use OCR (Tesseract) to locate text on scanned pages.
+    3. Crop around the found text and draw red rectangles with PIL.
 
     Args:
         pdf_path: Path to the original PDF
@@ -236,91 +239,111 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
     mat = fitz.Matrix(scale, scale)
     screenshots = {}
 
+    # Check if PDF has searchable text layer
+    has_text = any(doc[i].get_text("text").strip() for i in range(min(3, len(doc))))
+
+    # Cache OCR textpages per page to avoid re-running OCR
+    ocr_cache = {}
+
+    def _search_on_page(page, page_idx, search_text):
+        """Search for text using native text layer or OCR fallback."""
+        if not search_text:
+            return []
+
+        # 1) Try native text search
+        if has_text:
+            rects = page.search_for(search_text)
+            if rects:
+                return rects
+
+        # 2) Try OCR-based search
+        if page_idx not in ocr_cache:
+            try:
+                ocr_cache[page_idx] = page.get_textpage_ocr(
+                    language="eng+chi_sim", dpi=150
+                )
+            except Exception:
+                ocr_cache[page_idx] = None
+
+        tp = ocr_cache[page_idx]
+        if tp:
+            rects = page.search_for(search_text, textpage=tp)
+            if rects:
+                return rects
+
+        # 3) Try progressively shorter substrings (on OCR textpage)
+        if len(search_text) > 4:
+            source = tp if tp else None
+            for length in range(len(search_text) - 2, max(3, len(search_text) // 3), -1):
+                sub = search_text[:length]
+                if source:
+                    rects = page.search_for(sub, textpage=source)
+                else:
+                    rects = page.search_for(sub)
+                if rects:
+                    return rects
+
+        return []
+
     for page_num, errors in page_errors.items():
         page_idx = page_num - 1
         if page_idx < 0 or page_idx >= len(doc):
             continue
 
         page = doc[page_idx]
+        pw = page.rect.width
+        ph = page.rect.height
 
         for idx, item in errors:
             error_text = item.get('error_text', '')
             if not error_text:
-                # Fall back: extract quoted text from content_desc
                 desc = item.get('content_desc', '')
                 quoted = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]+)["\u201c\u201d]', desc)
-                error_text = quoted[0] if quoted else desc[:15]
+                error_text = quoted[0] if quoted else ''
 
-            if not error_text:
-                # Full page screenshot, no annotation
+            rects = _search_on_page(page, page_idx, error_text)
+
+            if rects:
+                # === Found text: crop around it and draw red boxes ===
+                union = rects[0]
+                for r in rects[1:]:
+                    union = union | r
+
+                pad = 40
+                clip = fitz.Rect(
+                    max(0, union.x0 - pad), max(0, union.y0 - pad),
+                    min(pw, union.x1 + pad), min(ph, union.y1 + pad),
+                )
+                # Minimum 100pt dimensions
+                if clip.width < 100:
+                    cx = (clip.x0 + clip.x1) / 2
+                    clip.x0, clip.x1 = max(0, cx - 50), min(pw, cx + 50)
+                if clip.height < 100:
+                    cy = (clip.y0 + clip.y1) / 2
+                    clip.y0, clip.y1 = max(0, cy - 50), min(ph, cy + 50)
+
+                pix = page.get_pixmap(matrix=mat, clip=clip)
+                pil_img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+                draw = ImageDraw.Draw(pil_img)
+
+                for r in rects:
+                    x0 = int((r.x0 - clip.x0) * scale)
+                    y0 = int((r.y0 - clip.y0) * scale)
+                    x1 = int((r.x1 - clip.x0) * scale)
+                    y1 = int((r.y1 - clip.y0) * scale)
+                    # 4px thick red rectangle
+                    for w in range(4):
+                        draw.rectangle([x0 - w, y0 - w, x1 + w, y1 + w],
+                                       outline=(255, 0, 0))
+
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG", quality=85)
+                screenshots[idx] = buf.getvalue()
+
+            else:
+                # === Fallback: full page thumbnail (no red box) ===
                 pix = page.get_pixmap(matrix=mat)
-                screenshots[idx] = pix.tobytes("jpeg", jpg_quality=85)
-                continue
-
-            # Search for the error text on the page
-            rects = page.search_for(error_text)
-
-            # If not found, try progressively shorter substrings
-            if not rects and len(error_text) > 6:
-                for trim in range(2, len(error_text) // 2):
-                    rects = page.search_for(error_text[:len(error_text) - trim])
-                    if rects:
-                        break
-
-            if not rects:
-                # Full page screenshot, no annotation
-                pix = page.get_pixmap(matrix=mat)
-                screenshots[idx] = pix.tobytes("jpeg", jpg_quality=85)
-                continue
-
-            # Merge all found rects into bounding box (in page coordinates)
-            union = rects[0]
-            for r in rects[1:]:
-                union = union | r
-
-            # Clip region with padding (page coordinates)
-            pad = 40
-            clip = fitz.Rect(
-                max(0, union.x0 - pad),
-                max(0, union.y0 - pad),
-                min(page.rect.width, union.x1 + pad),
-                min(page.rect.height, union.y1 + pad),
-            )
-
-            # Ensure minimum dimensions for readability
-            min_dim = 100
-            if clip.width < min_dim:
-                cx = (clip.x0 + clip.x1) / 2
-                clip.x0 = max(0, cx - min_dim / 2)
-                clip.x1 = min(page.rect.width, cx + min_dim / 2)
-            if clip.height < min_dim:
-                cy = (clip.y0 + clip.y1) / 2
-                clip.y0 = max(0, cy - min_dim / 2)
-                clip.y1 = min(page.rect.height, cy + min_dim / 2)
-
-            # Render the clipped region (clean, no annotations)
-            pix = page.get_pixmap(matrix=mat, clip=clip)
-            img_data = pix.tobytes("png")
-
-            # Open with PIL and draw red rectangles
-            pil_img = Image.open(io.BytesIO(img_data)).convert("RGB")
-            draw = ImageDraw.Draw(pil_img)
-
-            for r in rects:
-                # Convert page coordinates to pixel coordinates relative to clip
-                x0 = int((r.x0 - clip.x0) * scale)
-                y0 = int((r.y0 - clip.y0) * scale)
-                x1 = int((r.x1 - clip.x0) * scale)
-                y1 = int((r.y1 - clip.y0) * scale)
-                # Draw thick red rectangle (3 pixels wide)
-                for w in range(3):
-                    draw.rectangle([x0 - w, y0 - w, x1 + w, y1 + w],
-                                   outline=(255, 0, 0))
-
-            # Save as JPEG
-            buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=85)
-            screenshots[idx] = buf.getvalue()
+                screenshots[idx] = pix.tobytes("jpeg", jpg_quality=80)
 
     doc.close()
     return screenshots
