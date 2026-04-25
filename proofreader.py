@@ -17,6 +17,8 @@ import anthropic
 COMPRESS_THRESHOLD = 10 * 1024 * 1024
 # Page image DPI for vision
 PAGE_DPI = 150
+# DPI for screenshot annotations in the report
+SCREENSHOT_DPI = 200
 # Pages per batch for API calls
 BATCH_SIZE = 4
 
@@ -46,6 +48,7 @@ PROOFREAD_SYSTEM_PROMPT = """你是一位拥有20年经验的资深教育出版�
     "page": "P2",
     "location": "Example 1 题干",
     "content_desc": "问题的具体描述，引用原文",
+    "error_text": "页面上能定位该错误的原文关键词或短语（用于文本搜索定位，越精确越好）",
     "suggestions": ["修改建议1", "修改建议2"],
     "severity": "高/中/低",
     "notes": "备注说明"
@@ -62,6 +65,7 @@ PROOFREAD_SYSTEM_PROMPT = """你是一位拥有20年经验的资深教育出版�
 - 不要遗漏任何问题，哪怕是很小的空格问题
 - 系统性问题（如全册空格不规范）请合并为一条，标注影响范围
 - 只输出JSON数组，不要包含其他文字
+- error_text字段非常重要，请填入页面上与该错误最相关的原文文字片段（5-30字），用于在PDF中精确定位错误位置
 - 如果没有发现问题，输出空数组 []"""
 
 
@@ -176,6 +180,117 @@ def _call_claude_vision(client, pages_batch, filename, model="claude-sonnet-4-5-
     return []
 
 
+def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
+    """Generate annotated page screenshots with red boxes around error locations.
+
+    Args:
+        pdf_path: Path to the original PDF
+        errata_items: List of errata dicts (must have 'page' and 'error_text')
+
+    Returns:
+        dict mapping item index -> JPEG bytes of the annotated page crop
+    """
+    # Group errors by page number
+    page_errors = {}
+    for idx, item in enumerate(errata_items):
+        page_str = item.get('page', 'P0')
+        nums = re.findall(r'\d+', page_str)
+        if not nums:
+            continue
+        page_num = int(nums[0])
+        page_errors.setdefault(page_num, []).append((idx, item))
+
+    doc = fitz.open(pdf_path)
+    screenshots = {}
+
+    for page_num, errors in page_errors.items():
+        page_idx = page_num - 1
+        if page_idx < 0 or page_idx >= len(doc):
+            continue
+
+        page = doc[page_idx]
+
+        for idx, item in errors:
+            error_text = item.get('error_text', '')
+            if not error_text:
+                # Fall back: use first 15 chars of content_desc
+                desc = item.get('content_desc', '')
+                # Try to extract quoted text
+                quoted = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]+)["\u201c\u201d]', desc)
+                error_text = quoted[0] if quoted else desc[:15]
+
+            if not error_text:
+                # Generate full page screenshot without annotation
+                mat = fitz.Matrix(SCREENSHOT_DPI / 72, SCREENSHOT_DPI / 72)
+                pix = page.get_pixmap(matrix=mat)
+                screenshots[idx] = pix.tobytes("jpeg", jpg_quality=85)
+                continue
+
+            # Search for the error text on the page
+            rects = page.search_for(error_text)
+
+            # If not found, try shorter substrings
+            if not rects and len(error_text) > 6:
+                for trim in range(2, len(error_text) // 2):
+                    rects = page.search_for(error_text[:len(error_text) - trim])
+                    if rects:
+                        break
+
+            if not rects:
+                # Still not found — render full page
+                mat = fitz.Matrix(SCREENSHOT_DPI / 72, SCREENSHOT_DPI / 72)
+                pix = page.get_pixmap(matrix=mat)
+                screenshots[idx] = pix.tobytes("jpeg", jpg_quality=85)
+                continue
+
+            # Merge all found rects into a bounding box with padding
+            union = rects[0]
+            for r in rects[1:]:
+                union = union | r  # union of rects
+
+            # Add padding (30pt each side)
+            pad = 30
+            clip = fitz.Rect(
+                max(0, union.x0 - pad),
+                max(0, union.y0 - pad),
+                min(page.rect.width, union.x1 + pad),
+                min(page.rect.height, union.y1 + pad),
+            )
+
+            # Ensure minimum height/width for readability
+            min_dim = 80
+            if clip.width < min_dim:
+                cx = (clip.x0 + clip.x1) / 2
+                clip.x0 = max(0, cx - min_dim / 2)
+                clip.x1 = min(page.rect.width, cx + min_dim / 2)
+            if clip.height < min_dim:
+                cy = (clip.y0 + clip.y1) / 2
+                clip.y0 = max(0, cy - min_dim / 2)
+                clip.y1 = min(page.rect.height, cy + min_dim / 2)
+
+            # Draw red rectangle annotations on a temp copy
+            # We use a shape to draw on the page pixmap
+            mat = fitz.Matrix(SCREENSHOT_DPI / 72, SCREENSHOT_DPI / 72)
+
+            # Draw red rectangles on the page
+            shape = page.new_shape()
+            for r in rects:
+                shape.draw_rect(r)
+            shape.finish(color=(1, 0, 0), width=1.5, fill=None)
+            shape.commit()
+
+            # Render the clipped area
+            pix = page.get_pixmap(matrix=mat, clip=clip)
+            screenshots[idx] = pix.tobytes("jpeg", jpg_quality=85)
+
+            # Remove annotations we just added (cleanup for next iteration)
+            # Undo the drawing by re-cleaning the page
+            page.clean_contents()
+
+    doc.close()
+    return screenshots
+
+
 def proofread_pdf(pdf_path: str, api_key: str, progress_callback=None, model="claude-sonnet-4-5-20250514"):
     """Main proofreading function.
 
@@ -246,6 +361,19 @@ def proofread_pdf(pdf_path: str, api_key: str, progress_callback=None, model="cl
 
     all_items.sort(key=page_sort_key)
 
+    # Step 5: Generate annotated screenshots
+    screenshots = {}
+    if all_items:
+        if progress_callback:
+            progress_callback('screenshot', 93, '正在生成错误截图标注...')
+        try:
+            screenshots = generate_screenshots(working_path, all_items)
+            if progress_callback:
+                progress_callback('screenshot', 97, f'已生成 {len(screenshots)} 张标注截图')
+        except Exception as e:
+            if progress_callback:
+                progress_callback('screenshot', 97, f'截图生成部分失败: {str(e)[:100]}')
+
     # Clean up temp file
     if compressed and os.path.exists(working_path):
         os.unlink(working_path)
@@ -257,5 +385,6 @@ def proofread_pdf(pdf_path: str, api_key: str, progress_callback=None, model="cl
         'filename': filename,
         'total_pages': total_pages,
         'errata_items': all_items,
+        'screenshots': screenshots,
         'compressed': compressed,
     }

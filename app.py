@@ -169,6 +169,7 @@ def _process_task(task, api_key, model):
                 filename=stem,
                 errata_items=result['errata_items'],
                 total_pages=result['total_pages'],
+                screenshots=result.get('screenshots', {}),
             )
 
             task.results.append({

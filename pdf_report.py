@@ -1,5 +1,6 @@
 """Generate errata PDF report in the human-review table format."""
 
+import io
 import os
 import platform
 from reportlab.lib.pagesizes import A4
@@ -7,7 +8,7 @@ from reportlab.lib.units import mm
 from reportlab.lib.colors import HexColor
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -83,7 +84,22 @@ s_note = _S('note', 7.5, HexColor('#7f8c8d'))
 s_footer = _S('footer', 7.5, HexColor('#95a5a6'))
 
 
-def generate_errata_pdf(output_path, filename, errata_items, total_pages, review_date=None):
+def _make_screenshot_flowable(img_bytes, max_w=45 * mm, max_h=40 * mm):
+    """Create an Image flowable from JPEG bytes, scaled to fit."""
+    buf = io.BytesIO(img_bytes)
+    img = Image(buf)
+    # Scale to fit within max dimensions while preserving aspect ratio
+    iw, ih = img.drawWidth, img.drawHeight
+    if iw <= 0 or ih <= 0:
+        return Paragraph('(截图)', _S('ss_err', 7, HexColor('#999999'), 1))
+    scale = min(max_w / iw, max_h / ih, 1.0)
+    img.drawWidth = iw * scale
+    img.drawHeight = ih * scale
+    return img
+
+
+def generate_errata_pdf(output_path, filename, errata_items, total_pages,
+                        review_date=None, screenshots=None):
     """Generate errata PDF report.
 
     Args:
@@ -92,10 +108,13 @@ def generate_errata_pdf(output_path, filename, errata_items, total_pages, review
         errata_items: List of dicts from proofreader
         total_pages: Total pages in original PDF
         review_date: Date string, defaults to today
+        screenshots: dict mapping item index -> JPEG bytes (from generate_screenshots)
 
     Returns:
         output_path
     """
+    if screenshots is None:
+        screenshots = {}
     from datetime import date
     if review_date is None:
         review_date = date.today().strftime('%Y年%m月%d日')
@@ -152,18 +171,30 @@ def generate_errata_pdf(output_path, filename, errata_items, total_pages, review
     els.append(Paragraph('<b>勘误详情</b>', s_section))
     els.append(Spacer(1, 2 * mm))
 
-    col_w = [7 * mm, 12 * mm, 55 * mm, 65 * mm, 10 * mm, 37 * mm]
+    has_screenshots = bool(screenshots)
 
-    header = [
-        Paragraph('<b>#</b>', s_th),
-        Paragraph('<b>页码</b>', s_th),
-        Paragraph('<b>位置 / 内容</b>', s_th),
-        Paragraph('<b>修改建议</b>', s_th),
-        Paragraph('<b>严重</b>', s_th),
-        Paragraph('<b>备注</b>', s_th),
-    ]
+    if has_screenshots:
+        col_w = [7 * mm, 10 * mm, 48 * mm, 48 * mm, 48 * mm, 10 * mm]
+        header = [
+            Paragraph('<b>#</b>', s_th),
+            Paragraph('<b>页码</b>', s_th),
+            Paragraph('<b>截图</b>', s_th),
+            Paragraph('<b>位置 / 内容</b>', s_th),
+            Paragraph('<b>修改建议</b>', s_th),
+            Paragraph('<b>严重</b>', s_th),
+        ]
+    else:
+        col_w = [7 * mm, 12 * mm, 55 * mm, 65 * mm, 10 * mm, 37 * mm]
+        header = [
+            Paragraph('<b>#</b>', s_th),
+            Paragraph('<b>页码</b>', s_th),
+            Paragraph('<b>位置 / 内容</b>', s_th),
+            Paragraph('<b>修改建议</b>', s_th),
+            Paragraph('<b>严重</b>', s_th),
+            Paragraph('<b>备注</b>', s_th),
+        ]
 
-    batch_size = 6
+    batch_size = 4 if has_screenshots else 6
     all_rows = []
 
     for i, err in enumerate(errata_items):
@@ -193,14 +224,30 @@ def generate_errata_pdf(output_path, filename, errata_items, total_pages, review
 
         notes_text = _esc(err.get('notes', ''))
 
-        row = [
-            Paragraph(str(i + 1), _S(f'n{i}', 8, C_DARK, 1)),
-            Paragraph(_esc(err.get('page', '?')), _S(f'p{i}', 8, C_DARK, 1)),
-            Paragraph(content_text, s_body_sm),
-            Paragraph(sugg_text, s_body_sm),
-            Paragraph(f'<b>{_esc(sev)}</b>', sev_style),
-            Paragraph(notes_text, s_note),
-        ]
+        if has_screenshots:
+            # Screenshot column
+            if i in screenshots:
+                ss_flowable = _make_screenshot_flowable(screenshots[i])
+            else:
+                ss_flowable = Paragraph('<i>(无截图)</i>', s_note)
+
+            row = [
+                Paragraph(str(i + 1), _S(f'n{i}', 8, C_DARK, 1)),
+                Paragraph(_esc(err.get('page', '?')), _S(f'p{i}', 8, C_DARK, 1)),
+                ss_flowable,
+                Paragraph(content_text, s_body_sm),
+                Paragraph(sugg_text, s_body_sm),
+                Paragraph(f'<b>{_esc(sev)}</b>', sev_style),
+            ]
+        else:
+            row = [
+                Paragraph(str(i + 1), _S(f'n{i}', 8, C_DARK, 1)),
+                Paragraph(_esc(err.get('page', '?')), _S(f'p{i}', 8, C_DARK, 1)),
+                Paragraph(content_text, s_body_sm),
+                Paragraph(sugg_text, s_body_sm),
+                Paragraph(f'<b>{_esc(sev)}</b>', sev_style),
+                Paragraph(notes_text, s_note),
+            ]
         all_rows.append((row, sev))
 
     # Render table in chunks
