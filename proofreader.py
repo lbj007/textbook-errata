@@ -303,47 +303,29 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
 
             rects = _search_on_page(page, page_idx, error_text)
 
+            # Render full page
+            pix = page.get_pixmap(matrix=mat)
+            pil_img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+
             if rects:
-                # === Found text: crop around it and draw red boxes ===
+                # Merge all rects into ONE bounding box, then draw a single red frame
                 union = rects[0]
                 for r in rects[1:]:
                     union = union | r
 
-                pad = 40
-                clip = fitz.Rect(
-                    max(0, union.x0 - pad), max(0, union.y0 - pad),
-                    min(pw, union.x1 + pad), min(ph, union.y1 + pad),
-                )
-                # Minimum 100pt dimensions
-                if clip.width < 100:
-                    cx = (clip.x0 + clip.x1) / 2
-                    clip.x0, clip.x1 = max(0, cx - 50), min(pw, cx + 50)
-                if clip.height < 100:
-                    cy = (clip.y0 + clip.y1) / 2
-                    clip.y0, clip.y1 = max(0, cy - 50), min(ph, cy + 50)
-
-                pix = page.get_pixmap(matrix=mat, clip=clip)
-                pil_img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
                 draw = ImageDraw.Draw(pil_img)
+                x0 = int(union.x0 * scale) - 4
+                y0 = int(union.y0 * scale) - 4
+                x1 = int(union.x1 * scale) + 4
+                y1 = int(union.y1 * scale) + 4
+                # 4px thick single red rectangle
+                for w in range(4):
+                    draw.rectangle([x0 - w, y0 - w, x1 + w, y1 + w],
+                                   outline=(255, 0, 0))
 
-                for r in rects:
-                    x0 = int((r.x0 - clip.x0) * scale)
-                    y0 = int((r.y0 - clip.y0) * scale)
-                    x1 = int((r.x1 - clip.x0) * scale)
-                    y1 = int((r.y1 - clip.y0) * scale)
-                    # 4px thick red rectangle
-                    for w in range(4):
-                        draw.rectangle([x0 - w, y0 - w, x1 + w, y1 + w],
-                                       outline=(255, 0, 0))
-
-                buf = io.BytesIO()
-                pil_img.save(buf, format="JPEG", quality=85)
-                screenshots[idx] = buf.getvalue()
-
-            else:
-                # === Fallback: full page thumbnail (no red box) ===
-                pix = page.get_pixmap(matrix=mat)
-                screenshots[idx] = pix.tobytes("jpeg", jpg_quality=80)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=85)
+            screenshots[idx] = buf.getvalue()
 
     doc.close()
     return screenshots
