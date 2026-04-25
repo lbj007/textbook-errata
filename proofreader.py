@@ -210,6 +210,8 @@ def _call_claude_vision(client, pages_batch, filename, model="claude-sonnet-4-5-
 def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
     """Generate annotated page screenshots with red boxes around error locations.
 
+    Uses PIL to draw red rectangles on rendered page images for reliability.
+
     Args:
         pdf_path: Path to the original PDF
         errata_items: List of errata dicts (must have 'page' and 'error_text')
@@ -217,6 +219,8 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
     Returns:
         dict mapping item index -> JPEG bytes of the annotated page crop
     """
+    from PIL import Image, ImageDraw
+
     # Group errors by page number
     page_errors = {}
     for idx, item in enumerate(errata_items):
@@ -228,6 +232,8 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
         page_errors.setdefault(page_num, []).append((idx, item))
 
     doc = fitz.open(pdf_path)
+    scale = SCREENSHOT_DPI / 72
+    mat = fitz.Matrix(scale, scale)
     screenshots = {}
 
     for page_num, errors in page_errors.items():
@@ -240,15 +246,13 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
         for idx, item in errors:
             error_text = item.get('error_text', '')
             if not error_text:
-                # Fall back: use first 15 chars of content_desc
+                # Fall back: extract quoted text from content_desc
                 desc = item.get('content_desc', '')
-                # Try to extract quoted text
                 quoted = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]+)["\u201c\u201d]', desc)
                 error_text = quoted[0] if quoted else desc[:15]
 
             if not error_text:
-                # Generate full page screenshot without annotation
-                mat = fitz.Matrix(SCREENSHOT_DPI / 72, SCREENSHOT_DPI / 72)
+                # Full page screenshot, no annotation
                 pix = page.get_pixmap(matrix=mat)
                 screenshots[idx] = pix.tobytes("jpeg", jpg_quality=85)
                 continue
@@ -256,7 +260,7 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
             # Search for the error text on the page
             rects = page.search_for(error_text)
 
-            # If not found, try shorter substrings
+            # If not found, try progressively shorter substrings
             if not rects and len(error_text) > 6:
                 for trim in range(2, len(error_text) // 2):
                     rects = page.search_for(error_text[:len(error_text) - trim])
@@ -264,19 +268,18 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
                         break
 
             if not rects:
-                # Still not found — render full page
-                mat = fitz.Matrix(SCREENSHOT_DPI / 72, SCREENSHOT_DPI / 72)
+                # Full page screenshot, no annotation
                 pix = page.get_pixmap(matrix=mat)
                 screenshots[idx] = pix.tobytes("jpeg", jpg_quality=85)
                 continue
 
-            # Merge all found rects into a bounding box with padding
+            # Merge all found rects into bounding box (in page coordinates)
             union = rects[0]
             for r in rects[1:]:
-                union = union | r  # union of rects
+                union = union | r
 
-            # Add padding (30pt each side)
-            pad = 30
+            # Clip region with padding (page coordinates)
+            pad = 40
             clip = fitz.Rect(
                 max(0, union.x0 - pad),
                 max(0, union.y0 - pad),
@@ -284,8 +287,8 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
                 min(page.rect.height, union.y1 + pad),
             )
 
-            # Ensure minimum height/width for readability
-            min_dim = 80
+            # Ensure minimum dimensions for readability
+            min_dim = 100
             if clip.width < min_dim:
                 cx = (clip.x0 + clip.x1) / 2
                 clip.x0 = max(0, cx - min_dim / 2)
@@ -295,24 +298,29 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
                 clip.y0 = max(0, cy - min_dim / 2)
                 clip.y1 = min(page.rect.height, cy + min_dim / 2)
 
-            # Draw red rectangle annotations on a temp copy
-            # We use a shape to draw on the page pixmap
-            mat = fitz.Matrix(SCREENSHOT_DPI / 72, SCREENSHOT_DPI / 72)
-
-            # Draw red rectangles on the page
-            shape = page.new_shape()
-            for r in rects:
-                shape.draw_rect(r)
-            shape.finish(color=(1, 0, 0), width=1.5, fill=None)
-            shape.commit()
-
-            # Render the clipped area
+            # Render the clipped region (clean, no annotations)
             pix = page.get_pixmap(matrix=mat, clip=clip)
-            screenshots[idx] = pix.tobytes("jpeg", jpg_quality=85)
+            img_data = pix.tobytes("png")
 
-            # Remove annotations we just added (cleanup for next iteration)
-            # Undo the drawing by re-cleaning the page
-            page.clean_contents()
+            # Open with PIL and draw red rectangles
+            pil_img = Image.open(io.BytesIO(img_data)).convert("RGB")
+            draw = ImageDraw.Draw(pil_img)
+
+            for r in rects:
+                # Convert page coordinates to pixel coordinates relative to clip
+                x0 = int((r.x0 - clip.x0) * scale)
+                y0 = int((r.y0 - clip.y0) * scale)
+                x1 = int((r.x1 - clip.x0) * scale)
+                y1 = int((r.y1 - clip.y0) * scale)
+                # Draw thick red rectangle (3 pixels wide)
+                for w in range(3):
+                    draw.rectangle([x0 - w, y0 - w, x1 + w, y1 + w],
+                                   outline=(255, 0, 0))
+
+            # Save as JPEG
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=85)
+            screenshots[idx] = buf.getvalue()
 
     doc.close()
     return screenshots
