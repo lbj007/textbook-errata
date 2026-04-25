@@ -210,53 +210,97 @@ def _call_claude_vision(client, pages_batch, filename, model="claude-sonnet-4-5-
 def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
     """Generate annotated page screenshots with red boxes around error locations.
 
-    Strategy:
-    1. Try direct text search first (works if PDF has text layer).
-    2. If no text layer, use OCR (Tesseract) to locate text on scanned pages.
-    3. Crop around the found text and draw red rectangles with PIL.
-
     Args:
         pdf_path: Path to the original PDF
         errata_items: List of errata dicts (must have 'page' and 'error_text')
 
     Returns:
-        dict mapping item index -> JPEG bytes of the annotated page crop
+        dict mapping item index -> JPEG bytes of the annotated full-page image
     """
     from PIL import Image, ImageDraw
 
-    # Group errors by page number
-    page_errors = {}
-    for idx, item in enumerate(errata_items):
-        page_str = item.get('page', 'P0')
+    def _parse_page_num(page_str):
+        """Extract first page number from various formats like 'P3', 'P3-P14(全册)', '全书系统性'.
+        Returns None for system-wide items that need multi-page search."""
         nums = re.findall(r'\d+', page_str)
-        if not nums:
-            continue
-        page_num = int(nums[0])
-        page_errors.setdefault(page_num, []).append((idx, item))
+        return int(nums[0]) if nums else None
+
+    def _get_search_candidates(item):
+        """Build a prioritized list of search strings from the errata item."""
+        candidates = []
+        seen = set()
+
+        def _add(text):
+            t = text.strip() if text else ''
+            if t and len(t) >= 2 and t not in seen:
+                seen.add(t)
+                candidates.append(t)
+
+        # 1) error_text as-is
+        et = item.get('error_text', '').strip()
+        _add(et)
+
+        # 2) Individual words from error_text (for multi-word phrases OCR can't match)
+        if et and ' ' in et:
+            for word in et.split():
+                word = word.strip('.,;:!?()[]{}"\'"')
+                if len(word) >= 3:
+                    _add(word)
+
+        # 3) Quoted strings from content_desc and suggestions
+        for field in ['content_desc', 'suggestions', 'notes']:
+            val = item.get(field, '')
+            if isinstance(val, list):
+                val = ' '.join(val)
+            quoted = re.findall(r'["\u201c\u201d\u300c]([^"\u201c\u201d\u300d]+)["\u201c\u201d\u300d]', val)
+            for q in quoted:
+                _add(q)
+
+        # 4) Location text
+        _add(item.get('location', ''))
+
+        # 5) Extract CJK/English fragments from content_desc as last resort
+        desc = item.get('content_desc', '')
+        # English words 4+ chars
+        for w in re.findall(r'[A-Za-z]{4,}', desc):
+            _add(w)
+        # Chinese fragments 2+ chars
+        for w in re.findall(r'[\u4e00-\u9fff]{2,}', desc):
+            _add(w)
+
+        return candidates
+
+    # Group errors by page number; None = needs multi-page search
+    page_errors = {}
+    multipage_errors = []  # items that need searching across pages
+    for idx, item in enumerate(errata_items):
+        page_str = item.get('page', '')
+        page_num = _parse_page_num(page_str)
+        if page_num is None:
+            multipage_errors.append((idx, item))
+        else:
+            page_errors.setdefault(page_num, []).append((idx, item))
 
     doc = fitz.open(pdf_path)
     scale = SCREENSHOT_DPI / 72
     mat = fitz.Matrix(scale, scale)
     screenshots = {}
 
-    # Check if PDF has searchable text layer
     has_text = any(doc[i].get_text("text").strip() for i in range(min(3, len(doc))))
-
-    # Cache OCR textpages per page to avoid re-running OCR
     ocr_cache = {}
 
-    def _search_on_page(page, page_idx, search_text):
-        """Search for text using native text layer or OCR fallback."""
-        if not search_text:
+    def _search_text(page, page_idx, text):
+        """Search for exact text, then progressively shorter prefixes."""
+        if not text or len(text) < 2:
             return []
 
-        # 1) Try native text search
+        # Native text search
         if has_text:
-            rects = page.search_for(search_text)
+            rects = page.search_for(text)
             if rects:
                 return rects
 
-        # 2) Try OCR-based search
+        # OCR search
         if page_idx not in ocr_cache:
             try:
                 ocr_cache[page_idx] = page.get_textpage_ocr(
@@ -266,23 +310,51 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
                 ocr_cache[page_idx] = None
 
         tp = ocr_cache[page_idx]
-        if tp:
-            rects = page.search_for(search_text, textpage=tp)
-            if rects:
-                return rects
+        if not tp:
+            return []
 
-        # 3) Try progressively shorter substrings (on OCR textpage)
-        if len(search_text) > 4:
-            source = tp if tp else None
-            for length in range(len(search_text) - 2, max(3, len(search_text) // 3), -1):
-                sub = search_text[:length]
-                if source:
-                    rects = page.search_for(sub, textpage=source)
-                else:
-                    rects = page.search_for(sub)
+        rects = page.search_for(text, textpage=tp)
+        if rects:
+            return rects
+
+        # Progressively shorter substrings
+        if len(text) > 2:
+            min_len = max(2, len(text) // 3)
+            for length in range(len(text) - 1, min_len - 1, -1):
+                sub = text[:length]
+                rects = page.search_for(sub, textpage=tp)
                 if rects:
                     return rects
 
+        # Retry with higher DPI OCR as last resort
+        hi_key = (page_idx, 'hi')
+        if hi_key not in ocr_cache:
+            try:
+                ocr_cache[hi_key] = page.get_textpage_ocr(
+                    language="eng+chi_sim", dpi=300
+                )
+            except Exception:
+                ocr_cache[hi_key] = None
+        tp_hi = ocr_cache[hi_key]
+        if tp_hi:
+            rects = page.search_for(text, textpage=tp_hi)
+            if rects:
+                return rects
+            if len(text) > 2:
+                for length in range(len(text) - 1, min_len - 1, -1):
+                    rects = page.search_for(text[:length], textpage=tp_hi)
+                    if rects:
+                        return rects
+
+        return []
+
+    def _find_rects(page, page_idx, item):
+        """Try multiple search strategies to find annotatable rects."""
+        candidates = _get_search_candidates(item)
+        for text in candidates:
+            rects = _search_text(page, page_idx, text)
+            if rects:
+                return rects
         return []
 
     for page_num, errors in page_errors.items():
@@ -291,24 +363,18 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
             continue
 
         page = doc[page_idx]
-        pw = page.rect.width
-        ph = page.rect.height
+
+        # Pre-render the page once (all errors on same page share same base image)
+        pix = page.get_pixmap(matrix=mat)
+        page_png = pix.tobytes("png")
 
         for idx, item in errors:
-            error_text = item.get('error_text', '')
-            if not error_text:
-                desc = item.get('content_desc', '')
-                quoted = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]+)["\u201c\u201d]', desc)
-                error_text = quoted[0] if quoted else ''
+            rects = _find_rects(page, page_idx, item)
 
-            rects = _search_on_page(page, page_idx, error_text)
-
-            # Render full page
-            pix = page.get_pixmap(matrix=mat)
-            pil_img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            pil_img = Image.open(io.BytesIO(page_png)).convert("RGB")
 
             if rects:
-                # Merge all rects into ONE bounding box, then draw a single red frame
+                # Merge all rects into ONE bounding box
                 union = rects[0]
                 for r in rects[1:]:
                     union = union | r
@@ -318,7 +384,6 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
                 y0 = int(union.y0 * scale) - 4
                 x1 = int(union.x1 * scale) + 4
                 y1 = int(union.y1 * scale) + 4
-                # 4px thick single red rectangle
                 for w in range(4):
                     draw.rectangle([x0 - w, y0 - w, x1 + w, y1 + w],
                                    outline=(255, 0, 0))
@@ -326,6 +391,56 @@ def generate_screenshots(pdf_path: str, errata_items: list) -> dict:
             buf = io.BytesIO()
             pil_img.save(buf, format="JPEG", quality=85)
             screenshots[idx] = buf.getvalue()
+
+    # Handle system-wide items: search across pages to find the best match
+    for idx, item in multipage_errors:
+        candidates = _get_search_candidates(item)
+        best_rects = None
+        best_page_idx = None
+
+        # Search pages 1..N (skip cover which is usually graphical)
+        search_order = list(range(1, len(doc))) + [0]
+        for pi in search_order:
+            page = doc[pi]
+            # Don't use cache here — get fresh OCR per page to avoid weak ref issues
+            try:
+                tp = page.get_textpage_ocr(language="eng+chi_sim", dpi=150)
+            except Exception:
+                tp = None
+            for text in candidates:
+                if not text or len(text) < 2:
+                    continue
+                rects = page.search_for(text, textpage=tp) if tp else page.search_for(text)
+                if rects:
+                    best_rects = rects
+                    best_page_idx = pi
+                    break
+            if best_rects:
+                break
+
+        if best_page_idx is None:
+            best_page_idx = 0  # fallback to cover
+
+        page = doc[best_page_idx]
+        pix = page.get_pixmap(matrix=mat)
+        pil_img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+
+        if best_rects:
+            union = best_rects[0]
+            for r in best_rects[1:]:
+                union = union | r
+            draw = ImageDraw.Draw(pil_img)
+            x0 = int(union.x0 * scale) - 4
+            y0 = int(union.y0 * scale) - 4
+            x1 = int(union.x1 * scale) + 4
+            y1 = int(union.y1 * scale) + 4
+            for w in range(4):
+                draw.rectangle([x0 - w, y0 - w, x1 + w, y1 + w],
+                               outline=(255, 0, 0))
+
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=85)
+        screenshots[idx] = buf.getvalue()
 
     doc.close()
     return screenshots
